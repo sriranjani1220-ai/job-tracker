@@ -49,7 +49,7 @@ function parseGmail() {
   // Process application confirmation emails
   for (const query of queries) {
     try {
-      const threads = GmailApp.search(query, 0, 100);
+      const threads = GmailApp.search(query, 0, 300);
       for (const thread of threads) {
         const msg = thread.getMessages()[0];
         const parsed = parseApplicationEmail(msg);
