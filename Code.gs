@@ -64,10 +64,13 @@ function parseGmail() {
     }
   }
 
+  // Check for rejection emails and update status
+  const rejectionCount = parseRejections(sheet);
+
   // Refresh dashboard
   buildDashboard();
 
-  Logger.log(`Gmail Sync Complete: Found ${newCount} new applications.`);
+  Logger.log(`Gmail Sync Complete: Found ${newCount} new applications, ${rejectionCount} rejections detected.`);
 }
 
 function parseApplicationEmail(msg) {
@@ -173,6 +176,97 @@ function addRow(sheet, data) {
     data.date,
     data.notes
   ]);
+}
+
+// --- Rejection Email Detection ---
+
+function parseRejections(sheet) {
+  const data = sheet.getDataRange().getValues();
+  const trackedCompanies = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] && data[i][3] !== 'Rejected' && data[i][3] !== 'Offer') {
+      trackedCompanies.push({ row: i + 1, company: data[i][0].toString(), date: data[i][2] });
+    }
+  }
+
+  if (trackedCompanies.length === 0) return 0;
+
+  const rejectionQueries = [
+    'subject:"unfortunately" application newer_than:90d',
+    'subject:"not moving forward" newer_than:90d',
+    'subject:"decided not to" newer_than:90d',
+    'subject:"other candidates" newer_than:90d',
+    'subject:"position has been filled" newer_than:90d',
+    '"unfortunately" "application" newer_than:90d',
+    '"we will not be moving forward" newer_than:90d',
+    '"will not be progressing" newer_than:90d',
+    '"will not be moving forward" newer_than:90d',
+    '"move forward with other candidates" newer_than:90d',
+    '"has been filled" newer_than:90d',
+    '"after careful consideration" newer_than:90d',
+    '"decided to move forward with" newer_than:90d',
+    '"not been selected" newer_than:90d',
+    '"regret to inform" newer_than:90d',
+    '"will not be proceeding" newer_than:90d',
+    '"pursued other candidates" newer_than:90d',
+    '"not to move forward" newer_than:90d',
+  ];
+
+  const rejectionEmails = [];
+  for (const query of rejectionQueries) {
+    try {
+      const threads = GmailApp.search(query, 0, 30);
+      for (const thread of threads) {
+        const msg = thread.getMessages()[0];
+        rejectionEmails.push({
+          subject: msg.getSubject(),
+          from: msg.getFrom(),
+          body: msg.getPlainBody().substring(0, 1500),
+          date: msg.getDate()
+        });
+      }
+    } catch (e) {
+      Logger.log('Rejection query error: ' + query + ' - ' + e.message);
+    }
+  }
+
+  let count = 0;
+  const today = new Date();
+
+  for (const email of rejectionEmails) {
+    const emailText = (email.subject + ' ' + email.from + ' ' + email.body).toLowerCase();
+
+    for (const entry of trackedCompanies) {
+      const companyLower = entry.company.toLowerCase();
+      // Match if company name appears in the rejection email
+      if (emailText.includes(companyLower) || companyNameFuzzyMatch(companyLower, emailText)) {
+        // Ensure rejection email came after the application date
+        const appliedDate = new Date(entry.date);
+        if (email.date >= appliedDate) {
+          sheet.getRange(entry.row, 4).setValue('Rejected');
+          sheet.getRange(entry.row, 7).setValue(Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd'));
+          sheet.getRange(entry.row, 8).setValue('Rejection: ' + email.subject.substring(0, 60));
+          count++;
+          // Remove from tracked so we don't double-match
+          trackedCompanies.splice(trackedCompanies.indexOf(entry), 1);
+          break;
+        }
+      }
+    }
+  }
+
+  Logger.log(`Rejection Detection: Found ${count} rejection emails.`);
+  return count;
+}
+
+function companyNameFuzzyMatch(company, text) {
+  // Match first word of company name (handles "Google" matching "Google LLC" or "Alphabet/Google")
+  const firstWord = company.split(' ')[0];
+  if (firstWord.length >= 4 && text.includes(firstWord)) return true;
+  // Match without common suffixes
+  const stripped = company.replace(/\b(inc|llc|ltd|corp|co|company|technologies|tech|software|labs)\b/gi, '').trim();
+  if (stripped.length >= 4 && text.includes(stripped)) return true;
+  return false;
 }
 
 // --- Mark Ghosted (no response > 14 days) ---
@@ -380,9 +474,17 @@ function buildDashboard() {
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('Job Tracker')
     .addItem('Sync Gmail', 'parseGmail')
+    .addItem('Scan Rejections', 'scanRejectionsManual')
     .addItem('Mark Ghosted (>14 days)', 'markGhosted')
     .addItem('Refresh Dashboard', 'buildDashboard')
     .addToUi();
+}
+
+function scanRejectionsManual() {
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(DATA_SHEET);
+  const count = parseRejections(sheet);
+  buildDashboard();
+  SpreadsheetApp.getUi().alert(`Rejection scan complete: ${count} applications marked as Rejected.`);
 }
 
 // --- Auto-Sync Trigger (runs every 6 hours) ---
@@ -392,7 +494,7 @@ function setupAutoSync() {
 
   ScriptApp.newTrigger('parseGmail')
     .timeBased()
-    .everyHours(6)
+    .everyHours(2)
     .create();
 
   ScriptApp.newTrigger('onOpen')
@@ -400,5 +502,5 @@ function setupAutoSync() {
     .onOpen()
     .create();
 
-  Logger.log('Setup Complete: Auto-sync set up! Gmail will be checked every 6 hours.');
+  Logger.log('Setup Complete: Auto-sync set up! Gmail will be checked every 2 hours.');
 }
