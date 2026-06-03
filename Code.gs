@@ -178,26 +178,28 @@ function addRow(sheet, data) {
   ]);
 }
 
-// --- Rejection Email Detection ---
+// --- Rejection Email Detection (AI-Powered) ---
 
 function parseRejections(sheet) {
   const data = sheet.getDataRange().getValues();
   const trackedCompanies = [];
   for (let i = 1; i < data.length; i++) {
     if (data[i][0] && data[i][3] !== 'Rejected' && data[i][3] !== 'Offer') {
-      trackedCompanies.push({ row: i + 1, company: data[i][0].toString(), date: data[i][2] });
+      trackedCompanies.push({ row: i + 1, company: data[i][0].toString(), role: data[i][1]?.toString() || '', date: data[i][2] });
     }
   }
 
   if (trackedCompanies.length === 0) return 0;
 
   const rejectionQueries = [
-    'subject:"unfortunately" application newer_than:90d',
+    'subject:"unfortunately" newer_than:90d',
     'subject:"not moving forward" newer_than:90d',
     'subject:"decided not to" newer_than:90d',
     'subject:"other candidates" newer_than:90d',
     'subject:"position has been filled" newer_than:90d',
-    '"unfortunately" "application" newer_than:90d',
+    'subject:"update on your application" newer_than:90d',
+    'subject:"regarding your application" newer_than:90d',
+    'subject:"your application" "unfortunately" newer_than:90d',
     '"we will not be moving forward" newer_than:90d',
     '"will not be progressing" newer_than:90d',
     '"will not be moving forward" newer_than:90d',
@@ -210,63 +212,132 @@ function parseRejections(sheet) {
     '"will not be proceeding" newer_than:90d',
     '"pursued other candidates" newer_than:90d',
     '"not to move forward" newer_than:90d',
+    '"unfortunately" "application" newer_than:90d',
+    '"we have decided" "not" "forward" newer_than:90d',
+    '"unable to offer" newer_than:90d',
+    '"chosen not to" newer_than:90d',
   ];
 
+  // Deduplicate rejection emails by message ID
+  const seenIds = new Set();
   const rejectionEmails = [];
   for (const query of rejectionQueries) {
     try {
-      const threads = GmailApp.search(query, 0, 30);
+      const threads = GmailApp.search(query, 0, 300);
       for (const thread of threads) {
         const msg = thread.getMessages()[0];
-        rejectionEmails.push({
-          subject: msg.getSubject(),
-          from: msg.getFrom(),
-          body: msg.getPlainBody().substring(0, 1500),
-          date: msg.getDate()
-        });
+        const msgId = msg.getId();
+        if (!seenIds.has(msgId)) {
+          seenIds.add(msgId);
+          rejectionEmails.push({
+            subject: msg.getSubject(),
+            from: msg.getFrom(),
+            body: msg.getPlainBody().substring(0, 1500),
+            date: msg.getDate()
+          });
+        }
       }
     } catch (e) {
       Logger.log('Rejection query error: ' + query + ' - ' + e.message);
     }
   }
 
+  Logger.log(`Rejection scan: Found ${rejectionEmails.length} unique rejection-like emails to analyze.`);
+
+  // Build company list string for Claude
+  const companyList = trackedCompanies.map(e => e.company).join(', ');
   let count = 0;
   const today = new Date();
 
   for (const email of rejectionEmails) {
-    const emailText = (email.subject + ' ' + email.from + ' ' + email.body).toLowerCase();
+    // Use Claude AI to extract company name from rejection email
+    const extracted = askClaudeRejection(email.subject, email.from, email.body, companyList);
+    if (!extracted || !extracted.company || extracted.company === 'UNKNOWN' || extracted.is_rejection === false) continue;
 
-    for (const entry of trackedCompanies) {
-      const companyLower = entry.company.toLowerCase();
-      // Match if company name appears in the rejection email
-      if (emailText.includes(companyLower) || companyNameFuzzyMatch(companyLower, emailText)) {
-        // Ensure rejection email came after the application date
+    const extractedCompany = extracted.company.toLowerCase().trim();
+
+    // Match against tracked companies
+    for (let j = 0; j < trackedCompanies.length; j++) {
+      const entry = trackedCompanies[j];
+      const trackedLower = entry.company.toLowerCase().trim();
+
+      // Flexible matching: exact, contains, or first-word match
+      const isMatch = trackedLower === extractedCompany ||
+        trackedLower.includes(extractedCompany) ||
+        extractedCompany.includes(trackedLower) ||
+        (trackedLower.split(' ')[0].length >= 3 && extractedCompany.includes(trackedLower.split(' ')[0])) ||
+        (extractedCompany.split(' ')[0].length >= 3 && trackedLower.includes(extractedCompany.split(' ')[0]));
+
+      if (isMatch) {
         const appliedDate = new Date(entry.date);
         if (email.date >= appliedDate) {
           sheet.getRange(entry.row, 4).setValue('Rejected');
           sheet.getRange(entry.row, 7).setValue(Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd'));
           sheet.getRange(entry.row, 8).setValue('Rejection: ' + email.subject.substring(0, 60));
           count++;
-          // Remove from tracked so we don't double-match
-          trackedCompanies.splice(trackedCompanies.indexOf(entry), 1);
+          trackedCompanies.splice(j, 1);
+          // Update company list for remaining calls
           break;
         }
       }
     }
   }
 
-  Logger.log(`Rejection Detection: Found ${count} rejection emails.`);
+  Logger.log(`Rejection Detection: Matched ${count} rejections to tracked applications.`);
   return count;
 }
 
-function companyNameFuzzyMatch(company, text) {
-  // Match first word of company name (handles "Google" matching "Google LLC" or "Alphabet/Google")
-  const firstWord = company.split(' ')[0];
-  if (firstWord.length >= 4 && text.includes(firstWord)) return true;
-  // Match without common suffixes
-  const stripped = company.replace(/\b(inc|llc|ltd|corp|co|company|technologies|tech|software|labs)\b/gi, '').trim();
-  if (stripped.length >= 4 && text.includes(stripped)) return true;
-  return false;
+function askClaudeRejection(subject, from, body, companyList) {
+  const prompt = `Analyze this email and determine:
+1. Is this a job application REJECTION email? (not a marketing email, not a newsletter, not spam)
+2. What company sent this rejection?
+
+From: ${from}
+Subject: ${subject}
+Body (first 1500 chars):
+${body}
+
+Here are the companies I have applied to: ${companyList}
+
+Rules:
+- Only return is_rejection: true if the email is clearly rejecting a job application
+- Company: Match to one of the companies I applied to if possible. Use the EXACT name from my list.
+- If the company in the email is a variant of a name in my list (e.g., "Ultimate Kronos Group" = "UKG"), use the name from MY LIST
+- If you cannot match to my list, return the company name from the email
+- If you truly cannot determine the company, return "UNKNOWN"
+
+Respond ONLY in this exact JSON format:
+{"is_rejection": true, "company": "Company Name"}`;
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      payload: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 100,
+        messages: [{
+          role: 'user',
+          content: prompt
+        }]
+      }),
+      muteHttpExceptions: true
+    });
+
+    const result = JSON.parse(response.getContentText());
+    const text = result.content[0].text.trim();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+  } catch (e) {
+    Logger.log('Claude Rejection API error: ' + e.message);
+  }
+  return null;
 }
 
 // --- Mark Ghosted (no response > 14 days) ---
