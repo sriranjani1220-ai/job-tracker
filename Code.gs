@@ -29,16 +29,27 @@ function parseGmail() {
     'subject:"thank you for applying" newer_than:90d',
     'subject:"thanks for applying" newer_than:90d',
     'subject:"thank you for your application" newer_than:90d',
+    'subject:"thank you for your interest" newer_than:90d',
     'subject:"we received your application" newer_than:90d',
+    'subject:"we have received your resume" newer_than:90d',
     'subject:"application submitted" newer_than:90d',
+    'subject:"successfully submitted" newer_than:90d',
     'subject:"your application was sent" newer_than:90d',
+    'subject:"your application for" newer_than:90d',
+    'subject:"application for" subject:"at" newer_than:90d',
+    'subject:"you applied to" newer_than:90d',
     'subject:"your application" newer_than:90d -subject:"update" -subject:"status"',
     // Body-based searches (catches emails with generic subjects)
     '"your application was sent to" newer_than:90d',
     '"thank you for applying" newer_than:90d',
     '"thanks for applying" newer_than:90d',
     '"thank you for your application" newer_than:90d',
+    '"thank you for your interest" newer_than:90d',
     '"your application has been submitted" newer_than:90d',
+    '"successfully submitted" "application" newer_than:90d',
+    '"we have received your resume" newer_than:90d',
+    '"you applied to" newer_than:90d',
+    '"your application for" newer_than:90d',
     // Application AND (Received OR Submitted) in same email
     'application received newer_than:90d',
     'application submitted newer_than:90d',
@@ -157,10 +168,25 @@ function getExistingLinks(sheet) {
 }
 
 function isDuplicate(parsed, existingCompanies, sheet) {
-  const companyLower = parsed.company.toLowerCase();
-  if (existingCompanies.has(companyLower)) return true;
-  for (const existing of existingCompanies) {
-    if (existing.includes(companyLower) || companyLower.includes(existing)) return true;
+  const companyLower = parsed.company.toLowerCase().trim();
+  const roleLower = (parsed.role || '').toLowerCase().trim();
+
+  // Check against existing entries — deduplicate by company + role combo
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    const existingCompany = (data[i][0] || '').toString().toLowerCase().trim();
+    const existingRole = (data[i][1] || '').toString().toLowerCase().trim();
+
+    // Exact company match — check if same role too
+    if (existingCompany === companyLower) {
+      // Same company AND same role (or very similar) = duplicate
+      if (!roleLower || !existingRole || roleLower === existingRole ||
+          roleLower.includes(existingRole) || existingRole.includes(roleLower)) {
+        return true;
+      }
+      // Different role at same company = NOT a duplicate (applied for multiple roles)
+      continue;
+    }
   }
   return false;
 }
